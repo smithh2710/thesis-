@@ -1,9 +1,43 @@
-function [comp_h, press_h, temp_h, pressbub_h, pressdew_h] = main_nonisothermal(h, h_ref, comp_ref, press_ref, temp_ref, dTdh, Pc, Tc, acentric, BIP, M_gmol, Cp_coeffs, H_ig_ref)
-% ... [keep existing header comments]
+function [comp_h, press_h, temp_h] = main_hasse(h_target, h_ref, comp_ref, P_ref, T_ref, dTdh, Pc, Tc, acentric, BIP, M_gmol, Cp_coeffs, H_ig_ref)
+% Step-wise integration from h_ref to h_target
+
+    step_size = 1;  % 1 meter steps
+    
+    if h_target > h_ref
+        depths = h_ref:step_size:h_target;
+    else
+        depths = h_ref:-step_size:h_target;
+    end
+    
+    % Initialize
+    comp_current = comp_ref;
+    P_current = P_ref;
+    T_current = T_ref;
+    
+    for i = 2:length(depths)
+        h_prev = depths(i-1);
+        h_curr = depths(i);
+        
+        % Single step calculation
+        [comp_current, P_current, T_current] = main_hasse_single_step(...
+            h_curr, h_prev, comp_current, P_current, T_current, dTdh, ...
+            Pc, Tc, acentric, BIP, M_gmol, Cp_coeffs, H_ig_ref);
+    end
+    
+    comp_h = comp_current;
+    press_h = P_current;
+    temp_h = T_current;
+    
+    fprintf('Step-wise result at %.0f m: P = %.2f bar\n', h_target, press_h/1e5);
+
+end
+
+
+function [comp_h, press_h, temp_h] = main_hasse_single_step(h, h_ref, comp_ref, P, T, dTdh, Pc, Tc, acentric, BIP, M_gmol, Cp_coeffs, H_ig_ref)
+% Single step Haase calculation (small delta_h)
 
     R = 8.3144598;
     g = 9.80665;
-
     n = length(comp_ref);
 
     comp_ref = comp_ref(:);
@@ -12,163 +46,90 @@ function [comp_h, press_h, temp_h, pressbub_h, pressdew_h] = main_nonisothermal(
     Pc = Pc(:);
     Tc = Tc(:);
     acentric = acentric(:);
-    H_ig_ref = H_ig_ref(:);
-
-    M_kgmol = M_gmol / 1000;
 
     delta_h = h - h_ref;
-    temp_h = temp_ref + dTdh * delta_h;
+    delta_T = dTdh * delta_h;
+    temp_h = T + delta_T;
 
-    tol = 1e-10;
-    maxiter = 1500;
+    % Reference fugacities
+    [fugcoef_ref, ~] = fugacitycoef_multicomp(comp_ref, P, T, Pc, Tc, acentric, BIP);
+    f_ref = fugcoef_ref .* comp_ref * P;
 
-    % Calculate fugacity at reference conditions
-    [fugcoef_ref, ~] = fugacitycoef_multicomp(comp_ref, press_ref, temp_ref, Pc, Tc, acentric, BIP);
-    f_ref = fugcoef_ref .* comp_ref * press_ref;
+    % Enthalpy at current step
+    [H_mix_specific, H_partial_specific, ~, ~, ~] = calculate_absolute_enthalpy(...
+        temp_h, P, comp_ref, Pc, Tc, acentric, BIP, M_gmol, Cp_coeffs, H_ig_ref);
 
-    % Initial guess
-    initial_guess = [comp_ref; press_ref];
+    % Compute terms
+    term2 = zeros(n, 1);
+    term3 = zeros(n, 1);
 
-    % Create parameter structure
+    for i = 1:n
+        M_i_kg = M_gmol(i) / 1000;
+        term2(i) = M_i_kg * g * delta_h / (R * T);
+        
+        enthalpy_diff = H_mix_specific - H_partial_specific(i);
+        term3(i) = M_gmol(i) * enthalpy_diff * delta_T / (R * T^2);
+    end
+
+    % Setup parameters
+    params = struct();
     params.f_ref = f_ref;
-    params.temp_ref = temp_ref;
-    params.temp_h = temp_h;
-    params.delta_h = delta_h;
+    params.term2 = term2;
+    params.term3 = term3;
+    params.T_ref = T;
     params.Pc = Pc;
     params.Tc = Tc;
     params.acentric = acentric;
     params.BIP = BIP;
-    params.M_gmol = M_gmol;
-    params.M_kgmol = M_kgmol;
-    params.Cp_coeffs = Cp_coeffs;
-    params.H_ig_ref = H_ig_ref;
-    params.R = R;
-    params.g = g;
     params.n = n;
-    params.comp_ref = comp_ref;       % ADD THIS
-    params.press_ref = press_ref;     % ADD THIS
 
-    % Solve
-    residual_fun = @(x) residual_haase_corrected(x, params);
+    initial_guess = [comp_ref; P];
 
     options = optimoptions('fsolve', ...
         'Display', 'none', ...
         'FunctionTolerance', 1e-12, ...
         'StepTolerance', 1e-12, ...
-        'OptimalityTolerance', 1e-12, ...
-        'MaxIterations', maxiter, ...
-        'MaxFunctionEvaluations', maxiter * (n+1));
+        'MaxIterations', 200);
 
-    [solution, ~, exitflag] = fsolve(residual_fun, initial_guess, options);
-
-    if exitflag <= 0
-        warning('main_nonisothermal: fsolve did not converge (exitflag = %d)', exitflag);
-    end
+    [solution, ~, ~] = fsolve(@(x) residual_haase(x, params), initial_guess, options);
 
     comp_h = solution(1:n);
     press_h = solution(end);
 
-    comp_h = max(comp_h, 0);
+    comp_h = max(comp_h, 1e-15);
     comp_h = comp_h / sum(comp_h);
-
-    % Bubble point
-    try
-        pressbub_ini = 260e5;
-        [pressbub_h, ~] = pressbub_multicomp_newton(comp_h, pressbub_ini, temp_h, Pc, Tc, acentric, BIP, tol, maxiter);
-        if ~isreal(pressbub_h) || pressbub_h <= 0 || ~isfinite(pressbub_h)
-            pressbub_h = NaN;
-        end
-    catch
-        pressbub_h = NaN;
-    end
-
-    % Dew point
-    try
-        pressdew_ini = 260e5;
-        [pressdew_h, ~] = pressdew_multicomp_newton(comp_h, pressdew_ini, temp_h, Pc, Tc, acentric, BIP, tol, maxiter);
-        if ~isreal(pressdew_h) || pressdew_h <= 0 || ~isfinite(pressdew_h)
-            pressdew_h = NaN;
-        end
-    catch
-        pressdew_h = NaN;
-    end
 
 end
 
 
-function F = residual_haase_corrected(x, params)
-% CORRECTED Haase residual function
-%
-% Key fix: Enthalpy terms calculated at REFERENCE conditions, not target conditions
-% This matches the Pedersen et al. (2015) formulation more closely
+function F = residual_haase(x, params)
 
-    % Extract parameters
     f_ref = params.f_ref;
-    temp_ref = params.temp_ref;
-    temp_h = params.temp_h;
-    delta_h = params.delta_h;
+    term2 = params.term2;
+    term3 = params.term3;
+    T_ref = params.T_ref;
     Pc = params.Pc;
     Tc = params.Tc;
     acentric = params.acentric;
     BIP = params.BIP;
-    M_gmol = params.M_gmol;
-    M_kgmol = params.M_kgmol;
-    Cp_coeffs = params.Cp_coeffs;
-    H_ig_ref = params.H_ig_ref;
-    R = params.R;
-    g = params.g;
     n = params.n;
-    comp_ref = params.comp_ref;
-    press_ref = params.press_ref;
 
-    % Extract current trial values
     z_h = x(1:n);
     P_h = x(end);
 
     z_h = max(z_h, 1e-15);
     z_h_norm = z_h / sum(z_h);
-    P_h = max(P_h, 1e5);
+    P_h = max(P_h, 1e2);
 
-    %% Calculate enthalpies at REFERENCE conditions (not target!)
-    % This is a key point - Pedersen uses reference state enthalpies
-    [H_abs_ref, H_mix_ref, ~, ~, ~] = calculate_absolute_enthalpy(...
-        temp_ref, press_ref, comp_ref, Pc, Tc, acentric, BIP, M_gmol, Cp_coeffs, H_ig_ref);
+    [fugcoef_h, ~] = fugacitycoef_multicomp(z_h_norm, P_h, T_ref, Pc, Tc, acentric, BIP);
 
-    % Mixture molecular weight at reference [g/mol]
-    M_mix_ref = sum(comp_ref .* M_gmol);
-    
-    % Specific enthalpies at reference [J/g]
-    H_specific_mix_ref = H_mix_ref / M_mix_ref;
-    H_specific_i_ref = H_abs_ref ./ M_gmol;
-
-    %% Calculate fugacity coefficients at TARGET conditions
-    [fugcoef_h, ~] = fugacitycoef_multicomp(z_h_norm, P_h, temp_h, Pc, Tc, acentric, BIP);
-    f_h_current = fugcoef_h .* z_h_norm * P_h;
-
-    %% Calculate target fugacity using Haase equation
-    delta_T = temp_h - temp_ref;
-    f_h_target = zeros(n, 1);
+    F = zeros(n+1, 1);
 
     for i = 1:n
-        % Gravitational term (POSITIVE for deeper locations)
-        grav_term = (M_kgmol(i) * g * delta_h) / (R * temp_h);
-
-        % Thermal term using REFERENCE enthalpies
-        % (H/M - H_i/M_i) at reference conditions
-        enthalpy_diff = H_specific_mix_ref - H_specific_i_ref(i);  % [J/g]
-        
-        % Haase thermal term: M_i * (H/M - H_i/M_i) * dT / (R * T * T_ref)
-        % Units: [g/mol] * [J/g] * [K] / ([J/(mol·K)] * [K] * [K]) = dimensionless
-        thermal_term = (M_gmol(i) * enthalpy_diff * delta_T) / (R * temp_h * temp_ref);
-
-        % Target fugacity: add gravity, subtract thermal
-        ln_f_target = log(f_ref(i)) + grav_term - thermal_term;
-        f_h_target(i) = exp(ln_f_target);
+        f_i_h = fugcoef_h(i) * z_h_norm(i) * P_h;
+        F(i) = log(f_i_h / f_ref(i)) - term2(i) + term3(i);
     end
 
-    %% Residual equations
-    F = zeros(n+1, 1);
-    F(1:n) = f_h_current - f_h_target;
     F(n+1) = sum(z_h) - 1;
 
 end
